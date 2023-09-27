@@ -2,13 +2,17 @@ use crate::api::ast_eval::EvalContext;
 use crate::api::ast_eval::EvalOps;
 use crate::api::ast_eval::EvalPos;
 use crate::api::halo2::verify_aggregation_proofs;
+use crate::circuit_verifier::circuit::aggregator_circuit_public_input_size;
 use crate::circuits::utils::instance_to_instance_commitment;
+use crate::solidity_verifier::sha256::SolidityShaRead;
+use crate::solidity_verifier::sha256::SolidityShaSelector;
 use crate::transcript::sha256::ShaRead;
 use halo2_proofs::arithmetic::BaseExt;
 use halo2_proofs::arithmetic::CurveAffine;
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::arithmetic::MillerLoopResult;
 use halo2_proofs::arithmetic::MultiMillerLoop;
+use halo2_proofs::pairing::group::prime::PrimeCurveAffine;
 use halo2_proofs::pairing::group::Curve;
 use halo2_proofs::pairing::group::Group;
 use halo2_proofs::plonk::VerifyingKey;
@@ -18,6 +22,7 @@ use halo2_proofs::transcript::EncodedChallenge;
 use halo2_proofs::transcript::Transcript;
 use halo2_proofs::transcript::TranscriptRead;
 use halo2ecc_s::utils::field_to_bn;
+use sha2::Digest;
 use std::collections::BTreeSet;
 use std::env;
 use std::io::Read;
@@ -92,11 +97,20 @@ impl<E: MultiMillerLoop> SolidityVar<E> {
     }
 }
 
-struct SolidityEvalContext<R: Read, E: MultiMillerLoop> {
+pub trait SolidityTranscript<C: CurveAffine>:
+    TranscriptRead<C, Challenge255<C>> + Transcript<C, Challenge255<C>>
+{
+}
+
+impl<R: Read, C: CurveAffine, D: Digest + Clone> SolidityTranscript<C>
+    for ShaRead<R, C, Challenge255<C>, D>
+{
+}
+
+struct SolidityEvalContext<E: MultiMillerLoop, T: SolidityTranscript<E::G1Affine>> {
     c: EvalContext<E::G1Affine>,
     instance_commitments: Vec<E::G1Affine>,
-    t: ShaRead<R, E::G1Affine, Challenge255<E::G1Affine>, sha2::Sha256>,
-
+    t: T,
     statements: Vec<String>,
     exprs: Vec<Option<SolidityVar<E>>>,
     values: Vec<(Option<E::G1Affine>, Option<E::Scalar>)>,
@@ -114,12 +128,8 @@ struct SolidityEvalContext<R: Read, E: MultiMillerLoop> {
     msm_len: Vec<usize>,
 }
 
-impl<R: Read, E: MultiMillerLoop> SolidityEvalContext<R, E> {
-    pub fn new(
-        c: EvalContext<E::G1Affine>,
-        instance_commitments: Vec<E::G1Affine>,
-        t: ShaRead<R, E::G1Affine, Challenge255<E::G1Affine>, sha2::Sha256>,
-    ) -> Self {
+impl<E: MultiMillerLoop, T: SolidityTranscript<E::G1Affine>> SolidityEvalContext<E, T> {
+    pub fn new(c: EvalContext<E::G1Affine>, instance_commitments: Vec<E::G1Affine>, t: T) -> Self {
         Self {
             c,
             instance_commitments,
@@ -520,40 +530,50 @@ impl<R: Read, E: MultiMillerLoop> SolidityEvalContext<R, E> {
 pub fn solidity_codegen_with_proof<E: MultiMillerLoop>(
     params: &ParamsVerifier<E>,
     vkey: &VerifyingKey<E::G1Affine>,
-    instances: &Vec<E::Scalar>,
-    proofs: Vec<u8>,
     tera_context: &mut tera::Context,
+    verify: Option<(&Vec<E::Scalar>, &Vec<u8>)>,
 ) -> Vec<String> {
     let (w_x, w_g, _) = verify_aggregation_proofs(params, &[vkey]);
 
-    let instance_commitments =
-        instance_to_instance_commitment(params, &[vkey], vec![&vec![instances.clone()]])[0].clone();
+    let (instance_commitments, hasher) = if let Some((instances, proof)) = verify {
+        (
+            instance_to_instance_commitment(params, &[vkey], vec![&vec![instances.clone()]])[0]
+                .clone(),
+            SolidityShaSelector::ShaRead(ShaRead::<_, _, _, sha2::Sha256>::init(&proof[..])),
+        )
+    } else {
+        (
+            vec![E::G1Affine::identity(); aggregator_circuit_public_input_size(1)],
+            SolidityShaSelector::SolidityShaRead(SolidityShaRead::<
+                E::G1Affine,
+                Challenge255<E::G1Affine>,
+            >::init()),
+        )
+    };
 
     let targets = vec![w_x.0, w_g.0];
 
     let c = EvalContext::translate(&targets[..]);
 
-    let mut ctx = SolidityEvalContext::<_, E>::new(
-        c,
-        instance_commitments,
-        ShaRead::<_, _, _, sha2::Sha256>::init(&proofs[..]),
-    );
+    let mut ctx = SolidityEvalContext::<E, _>::new(c, instance_commitments, hasher);
 
     ctx.value_gen();
     ctx.code_gen();
 
-    let s_g2_prepared = E::G2Prepared::from(params.s_g2);
-    let n_g2_prepared = E::G2Prepared::from(-params.g2);
-    let success = bool::from(
-        E::multi_miller_loop(&[
-            (&ctx.finals[0], &s_g2_prepared),
-            (&ctx.finals[1], &n_g2_prepared),
-        ])
-        .final_exponentiation()
-        .is_identity(),
-    );
+    if verify.is_some() {
+        let s_g2_prepared = E::G2Prepared::from(params.s_g2);
+        let n_g2_prepared = E::G2Prepared::from(-params.g2);
+        let success = bool::from(
+            E::multi_miller_loop(&[
+                (&ctx.finals[0], &s_g2_prepared),
+                (&ctx.finals[1], &n_g2_prepared),
+            ])
+            .final_exponentiation()
+            .is_identity(),
+        );
 
-    assert!(success);
+        assert!(success);
+    }
 
     tera_context.insert("n_constant_scalars", &ctx.constant_scalars.len());
 
@@ -620,7 +640,7 @@ pub fn solidity_aux_gen_data<E: MultiMillerLoop>(
 
     let c = EvalContext::translate(&targets[..]);
 
-    let mut ctx = SolidityEvalContext::<_, E>::new(
+    let mut ctx = SolidityEvalContext::<E, _>::new(
         c,
         instance_commitments,
         ShaRead::<_, _, _, sha2::Sha256>::init(&proofs[..]),

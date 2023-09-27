@@ -10,6 +10,7 @@ use std::path::Path;
 use tera::Tera;
 
 pub mod codegen;
+pub mod sha256;
 
 pub fn solidity_render<E: MultiMillerLoop>(
     path_in: &str,
@@ -21,8 +22,7 @@ pub fn solidity_render<E: MultiMillerLoop>(
     target_circuit_params: &ParamsVerifier<E>,
     verify_circuit_params: &ParamsVerifier<E>,
     vkey: &VerifyingKey<E::G1Affine>,
-    instances: &Vec<E::Scalar>,
-    proofs: Vec<u8>,
+    verify: Option<(&Vec<E::Scalar>, &Vec<u8>)>,
 ) {
     let tera = Tera::new(path_in).unwrap();
     let mut tera_ctx = tera::Context::new();
@@ -139,13 +139,7 @@ pub fn solidity_render<E: MultiMillerLoop>(
         + 5 * lookups;
     tera_ctx.insert("evals", &evals);
 
-    let steps = solidity_codegen_with_proof(
-        &verify_circuit_params,
-        &vkey,
-        instances,
-        proofs,
-        &mut tera_ctx,
-    );
+    let steps = solidity_codegen_with_proof(&verify_circuit_params, &vkey, &mut tera_ctx, verify);
 
     for (f_in, f_out) in common_template_name {
         let fd = std::fs::File::create(Path::new(path_out).join(f_out)).unwrap();
@@ -339,8 +333,7 @@ pub fn test_solidity_render() {
         verify_circuit_k,
         Some(&path.join(format!("K{}.params", verify_circuit_k))),
     );
-    let verifier_params_verifier: ParamsVerifier<Bn256> =
-        params.verifier(3 * n_proofs).unwrap();
+    let verifier_params_verifier: ParamsVerifier<Bn256> = params.verifier(3 * n_proofs).unwrap();
 
     let vkey = load_or_build_vkey::<Bn256, _>(
         &params,
@@ -362,8 +355,7 @@ pub fn test_solidity_render() {
         &target_params_verifier,
         &verifier_params_verifier,
         &vkey,
-        &instances,
-        proof.clone(),
+        Some((&instances, &proof)),
     );
 
     solidity_aux_gen(

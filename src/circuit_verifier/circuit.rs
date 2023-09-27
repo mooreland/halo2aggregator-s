@@ -18,6 +18,10 @@ use halo2ecc_s::circuit::select_chip::SelectChipConfig;
 use halo2ecc_s::context::Records;
 use std::rc::Rc;
 
+pub fn aggregator_circuit_public_input_size(n_proofs: usize) -> usize {
+    3 * n_proofs
+}
+
 #[derive(Clone)]
 pub struct AggregatorChipConfig {
     base_chip_config: BaseChipConfig,
@@ -80,9 +84,12 @@ impl<C: CurveAffine> Circuit<C::ScalarExt> for AggregatorCircuit<C> {
             || "base",
             |mut region| {
                 let timer = start_timer!(|| "assign");
-                let cells = self
-                    .records
-                    .assign_all_opt(&mut region, &base_chip, &range_chip, &select_chip)?;
+                let cells = self.records.assign_all_opt(
+                    &mut region,
+                    &base_chip,
+                    &range_chip,
+                    &select_chip,
+                )?;
 
                 match cells {
                     Some(cells) => {
